@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(npm run *)",
+      "Bash(findstr /v \"^$\")",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\(r'C:\\\\Users\\\\User\\\\OneDrive\\\\바탕 화면\\\\ems-interpret-ui\\\\backend\\\\ems_realtime.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax-ok'\\)\")",
+      "PowerShell(New-TemporaryFile *)",
+      "PowerShell(python \"C:\\\\Users\\\\User\\\\OneDrive\\\\바탕 화면\\\\ems-interpret-ui\\\\backend\\\\_test_reasoning.py\")",
+      "PowerShell(Remove-Item *)",
+      "PowerShell(python \"C:\\\\Users\\\\User\\\\OneDrive\\\\바탕 화면\\\\ems-interpret-ui\\\\backend\\\\_test_lang.py\")",
+      "PowerShell(python \"C:\\\\Users\\\\User\\\\OneDrive\\\\바탕 화면\\\\ems-interpret-ui\\\\backend\\\\_test_general.py\")",
+      "PowerShell(Get-Content *)",
+      "Bash(npm run *)",
+      "Bash(python -m py_compile backend/ems_realtime.py)"
+    ]
+  }
+}

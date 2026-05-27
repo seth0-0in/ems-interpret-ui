@@ -1,0 +1,53 @@
+/* 119 다국어 긴급구조 통역 시스템 - 전역 기본 스타일 */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+}
+
+body {
+  min-height: 100vh;
+  background-color: #0b1f3a;
+  font-family: "Pretendard", "Malgun Gothic", "맑은 고딕",
+    "Apple SD Gothic Neo", system-ui, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+button {
+  font-family: inherit;
+}
+
+textarea,
+input,
+select {
+  font-family: inherit;
+}
+
+/* 녹음 상태 표시용 점멸 애니메이션 */
+@keyframes ems-pulse {
+  0% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.3;
+    transform: scale(0.78);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
