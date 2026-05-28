@@ -5,35 +5,22 @@ import { useAppData } from "../context/AppDataContext";
 import AppHeader from "../components/AppHeader";
 import { COLORS, sectionHeading, whiteCard } from "../theme";
 import { LANGUAGE_OPTIONS } from "../languages";
-import { apiUrl } from "../api";
+import { apiUrl, diag, EMS_DEBUG } from "../api";
 
 // VAD 자산(worklet + ONNX 모델 + onnxruntime-web WASM)은
 // public/vad/ 에 복사되어 있다. Vite의 base("/static/119/")를 반영해 서빙된다.
 const VAD_ASSET_BASE = `${import.meta.env.BASE_URL}vad/`;
 
 // ---------------------------------------------------------------------------
-// Phase A 진단 로깅 (코드 로직 변경 없음 — 관찰자 패턴)
+// 진단 로깅 — diag/EMS_DEBUG 는 src/api.ts 의 단일 출처에서 import.
 //
-// `diag("event", { ... })` 로 한 줄 JSON-ish 로그를 출력한다. 운영자가
-// "첫 문장 후 안 듣는" 문제를 재현하면서 브라우저 콘솔에서 [ems-rt diag]
-// 로 grep 하면 VAD 콜백·placeholder·processChunk·audio queue 전 흐름이
-// chunk 단위로 한 줄씩 출력된다.
+// 결정 로직을 바꾸지 않는다 — 단지 관찰한다. EMS_DEBUG 가 false 면 diag 호출은
+// 즉시 return 되어 콘솔에 아무것도 찍히지 않는다. dev 빌드 / sessionStorage
+// 토글 / ?debug=1 중 하나라도 충족하면 ON. 자세한 규칙은 src/api.ts 참고.
 //
-// 결정 로직을 바꾸지 않는다 — 단지 관찰한다.
+// ⚠ 119 운영 — diag 페이로드에 발화 원문(STT/번역 결과 텍스트)을 절대 넣지
+// 않는다. 길이 / 언어 / seq 같은 메타데이터만 남긴다.
 // ---------------------------------------------------------------------------
-function diag(event: string, fields: Record<string, unknown> = {}): void {
-  // performance.now() 를 단조 증가 타임라인으로 함께 찍어 chunk 간 간격을
-  // 콘솔에서 바로 셀 수 있게 한다.
-  try {
-    // eslint-disable-next-line no-console
-    console.log(
-      `[ems-rt diag] ${event}`,
-      { t: Math.round(performance.now()), ...fields }
-    );
-  } catch {
-    // ignore
-  }
-}
 
 // 자동 판단된 발화자 역할.
 //   caller       — 신고자
@@ -1299,9 +1286,11 @@ function RealtimePage() {
           // language/role 은 서버가 fragment 단계에서 확정하지 않으므로 그대로 둔다.
           ...latencyPatch,
         });
+        // ⚠ 119 — 신고자/구급대원 발화 원문을 콘솔에 남기지 않는다.
+        // 길이만 찍어 fragment 가 누적되는지 진단은 가능하게 유지.
         diag("placeholder_listening", {
           seqId,
-          fragmentHead: fragmentPreview.slice(0, 60),
+          fragmentLen: fragmentPreview.length,
           bufferMs,
         });
         diag("process_out", {
@@ -1890,46 +1879,50 @@ function RealtimePage() {
     probs: { isSpeech: number; notSpeech: number },
     frame: Float32Array
   ) => {
-    // Phase B diag — 첫 프레임이 실제로 들어왔을 때 AudioContext 상태를 한 번 더 찍는다.
-    // vad.start() 직후 로그가 "suspended" 였더라도 첫 프레임 시점엔 "running" 이어야 정상.
-    if (!diagFirstFrameLoggedRef.current) {
-      diagFirstFrameLoggedRef.current = true;
-      try {
-        type VadPrivates = { _audioContext: AudioContext | null };
-        const ctx = (vadRef.current as unknown as VadPrivates | null)
-          ?._audioContext ?? null;
-        diag("vad_audioctx_first_frame", {
-          state: ctx?.state ?? "null",
-          sampleRate: ctx?.sampleRate ?? null,
-          resumed: ctx?.state === "running",
-          firstFrameLen: frame.length,
-          firstProbSpeech: Number(probs.isSpeech.toFixed(3)),
-          firstFrameRms: Number(computeRms(frame).toFixed(4)),
-        });
-      } catch (e) {
-        diag("vad_audioctx_first_frame_failed", {
-          error: e instanceof Error ? e.message : String(e),
+    // 진단: 첫 프레임 시점 AudioContext + frame metric, 그리고 ~10 frame 마다
+    // vad_frame 1회. 둘 다 매 프레임 콜백 hot-path 라 EMS_DEBUG off 일 때 RMS /
+    // toFixed 같은 계산이 아예 안 돌게 전체를 if(EMS_DEBUG) 로 감싼다.
+    if (EMS_DEBUG) {
+      // 첫 프레임이 실제로 들어왔을 때 AudioContext 상태를 한 번 더 찍는다.
+      // vad.start() 직후 로그가 "suspended" 였더라도 첫 프레임 시점엔 "running" 이어야 정상.
+      if (!diagFirstFrameLoggedRef.current) {
+        diagFirstFrameLoggedRef.current = true;
+        try {
+          type VadPrivates = { _audioContext: AudioContext | null };
+          const ctx = (vadRef.current as unknown as VadPrivates | null)
+            ?._audioContext ?? null;
+          diag("vad_audioctx_first_frame", {
+            state: ctx?.state ?? "null",
+            sampleRate: ctx?.sampleRate ?? null,
+            resumed: ctx?.state === "running",
+            firstFrameLen: frame.length,
+            firstProbSpeech: Number(probs.isSpeech.toFixed(3)),
+            firstFrameRms: Number(computeRms(frame).toFixed(4)),
+          });
+        } catch (e) {
+          diag("vad_audioctx_first_frame_failed", {
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+      // VAD 프레임 도달 + 음성 확률 + RMS.
+      //   콜백이 한 번도 안 불림  → 프레임 미도달 ((a) 스트림/노드 연결 문제)
+      //   불리는데 rms 도 ~0      → VAD 가 무음 stream 을 물고 있음 ((a/b))
+      //   rms 는 큰데 prob 만 ~0  → VAD 내부 (threshold / 샘플레이트 / 모델 입력) ((c))
+      //   prob 이 threshold 를 넘는데도 vad_start 안 뜸 → 콜백/배선 ((c))
+      // 매 프레임마다 찍으면 콘솔이 폭주하므로 ~10 frame (대략 300ms) 에 1회만 로그.
+      diagFrameCounterRef.current += 1;
+      if (diagFrameCounterRef.current >= 10) {
+        diagFrameCounterRef.current = 0;
+        diag("vad_frame", {
+          prob: Number(probs.isSpeech.toFixed(3)),
+          notSpeech: Number(probs.notSpeech.toFixed(3)),
+          rms: Number(computeRms(frame).toFixed(4)),
+          frameLen: frame.length,
+          recording: isRecordingRef.current,
+          speaking: pendingSeqIdRef.current !== null,
         });
       }
-    }
-    // Phase B diag — VAD 프레임 도달 + 음성 확률 + RMS.
-    //   콜백이 한 번도 안 불림  → 프레임 미도달 ((a) 스트림/노드 연결 문제)
-    //   불리는데 rms 도 ~0      → VAD 가 무음 stream 을 물고 있음 ((a/b))
-    //   rms 는 큰데 prob 만 ~0  → VAD 내부 (threshold / 샘플레이트 / 모델 입력) ((c))
-    //   prob 이 threshold 를 넘는데도 vad_start 안 뜸 → 콜백/배선 ((c))
-    // 매 프레임마다 찍으면 콘솔이 폭주하므로 ~10 frame (대략 300ms) 에 1회만 로그.
-    // throttle 은 meter setState 와 별개로 관리한다.
-    diagFrameCounterRef.current += 1;
-    if (diagFrameCounterRef.current >= 10) {
-      diagFrameCounterRef.current = 0;
-      diag("vad_frame", {
-        prob: Number(probs.isSpeech.toFixed(3)),
-        notSpeech: Number(probs.notSpeech.toFixed(3)),
-        rms: Number(computeRms(frame).toFixed(4)),
-        frameLen: frame.length,
-        recording: isRecordingRef.current,
-        speaking: pendingSeqIdRef.current !== null,
-      });
     }
     // SpeechStart~End/misfire 구간의 프레임을 항상 보관 — 폐기 로그(durationMs/RMS)
     // 및 multilingual 모드의 misfire 복구에 사용. vad-web이 frame 버퍼를 재사용하므로

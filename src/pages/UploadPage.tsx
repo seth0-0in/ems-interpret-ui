@@ -9,7 +9,7 @@ import type {
   TranscriptionResponse,
 } from "../context/AppDataContext";
 import { COLORS } from "../theme";
-import { apiUrl } from "../api";
+import { apiUrl, diag } from "../api";
 
 type MessageTranslationMap = Record<number, string>;
 
@@ -170,8 +170,7 @@ function UploadPage() {
       // 없이 서버 루트 origin-relative 로 반환하므로 dev/preview/운영 모두
       // "/api/119/realtime/process" 로 일관되게 나간다.
       const processUrl = apiUrl("/api/119/realtime/process");
-      // eslint-disable-next-line no-console
-      console.log("[ems-rt diag] upload_process_request_url", {
+      diag("upload_process_request_url", {
         url: processUrl,
         baseUrl: import.meta.env.BASE_URL,
       });
