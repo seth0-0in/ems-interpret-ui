@@ -804,8 +804,37 @@ async def call_stt(
 
     raw_lang = body.get("language") or body.get("detected_language") or ""
     detected = raw_lang.strip().lower()[:2] if isinstance(raw_lang, str) else ""
+    # 다국어 STT 진단용 — LANG_CODES 필터 전후 값을 모두 로그에 남기기 위해
+    # 필터 적용 직전의 normalized candidate 를 별도 캡처. logic 분기에는 사용하지 않는다.
+    _diag_normalized_candidate = detected
     if detected not in LANG_CODES:
         detected = None
+
+    # ⚠ 원문 / segment 원문은 절대 로그에 포함하지 않는다 — 길이 / 카운트 / 스크립트
+    # 분포만 남겨 베트남어/태국어/캄보디아어/네팔어/중국어/일본어가 안 잡힐 때
+    # (a) STT 응답 body 에 language/detected_language 키 자체가 있는지
+    # (b) raw_lang 값이 무엇으로 오는지 (예: "" / "vi" / "vie" / "zh-cn" / "cmn")
+    # (c) [:2] slice + LANG_CODES 필터로 None 으로 떨어졌는지
+    # (d) STT 가 그래도 텍스트는 잡았는지 (text_len) — 잡았다면 어느 스크립트인지
+    # 를 한 줄로 진단할 수 있게 한다.
+    _raw_body_segments = body.get("segments")
+    _diag(
+        "stt_raw_response",
+        mode=mode,
+        http_status=resp.status_code,
+        filename=filename,
+        body_keys=sorted(body.keys()),
+        has_language=("language" in body),
+        has_detected_language=("detected_language" in body),
+        raw_lang_repr=repr(raw_lang),
+        normalized_detected_candidate=_diag_normalized_candidate,
+        detected_after_lang_codes_filter=detected,
+        text_len=len(text),
+        segment_count=(
+            len(_raw_body_segments) if isinstance(_raw_body_segments, list) else 0
+        ),
+        script_summary=_script_summary(text),
+    )
 
     segments: list[dict] = []
     raw_segments = body.get("segments") or []
@@ -1677,12 +1706,19 @@ async def _process_diarization_segments(
     segments: list[dict],
     sess: SessionState,
     latency: dict,
+    stt_lang: Optional[str] = None,
 ) -> dict:
     """diarization 응답의 segment들을 segment 단위로 처리.
 
     각 segment마다 source_language 감지 / role 분류 / target 결정 / 번역을 수행하고
     세션의 caller language memory를 점진적으로 갱신한다 (영어 caller 등장 후의
     한국어 operator 발화는 영어로 번역되도록).
+
+    stt_lang 은 call_stt() 가 반환한 STT 응답의 raw language (LANG_CODES 로 정규화된
+    값) 다. segment 텍스트의 detect_language_from_text 결과만으로는 잡히지 않는 케이스
+    (특히 일본어: 한자-only segment → zh 오인, 환각 한글 1자 끼어듦 → ko 오인) 를
+    보조 신호로 보정한다. 기존 zh/vi/en 등이 성공하던 케이스는 detected==stt_lang 이라
+    분기 자체가 발생하지 않아 회귀 없음.
 
     반환 dict:
         enriched_segments       — spec #3에서 정의된 확장 필드를 갖는 segment 리스트
@@ -1728,7 +1764,29 @@ async def _process_diarization_segments(
             })
             continue
 
-        seg_lang = detect_language_from_text(seg_text)
+        detected = detect_language_from_text(seg_text)
+        seg_lang = detected
+        # ─── STT raw language 를 보조 신호로 보정 (일본어 ja 라우팅 실패 fix) ─────
+        # detect_language_from_text 는 첫-매치 우선순위 + kana 없는 한자만 있으면 zh
+        # 라는 두 한계로 일본어를 ko 또는 zh 로 오인할 수 있다. STT 응답이 "ja" 라고
+        # 직접 알려주면 segment 단위에서도 그것을 보조로 받아 ja 로 보정한다.
+        # 다른 언어(zh/vi/th/km/ne/en 등) 는 detected 가 unknown 일 때만 stt_lang 으로
+        # 폴백해 회귀를 차단한다.
+        if stt_lang in LANG_CODES:
+            if stt_lang == "ja" and detected in ("unknown", "zh", "ko"):
+                seg_lang = "ja"
+            elif detected == "unknown":
+                seg_lang = stt_lang
+        # ⚠ 원문은 로그에 남기지 않는다 — 길이 / script 분포 / 결정 결과만.
+        _diag(
+            "diarize_lang_resolution",
+            detected_by_text=detected,
+            stt_lang=stt_lang,
+            final_seg_lang=seg_lang,
+            script_summary=_script_summary(seg_text),
+            segment_text_len=len(seg_text),
+            overridden=(seg_lang != detected),
+        )
         classification = classify_speaker(seg_text, seg_lang, sess)
         role = classification["speaker"]
         src = classification["source_language"]
@@ -1875,6 +1933,50 @@ def _text_head(text: Optional[str], limit: int = _DIAG_TEXT_HEAD) -> str:
     if len(t) <= limit:
         return t
     return t[:limit] + f"...<+{len(t) - limit}c>"
+
+
+# 다국어 STT 진단용 — 응답 텍스트의 스크립트(유니코드 블록) 카운트만 집계.
+# 절대 원문을 반환하지 않는다. raw_lang 가 비어 있을 때 텍스트가 어느 스크립트로
+# 나왔는지(latin/zh/kana/hangul/deva/thai/khmer) 한 줄로 확인해 LID 가 STT 자체에서
+# 안 나온 건지, 코드 normalize 단계에서 떨어진 건지, STT 가 영어로 hallucinate 한 건지
+# 구분할 수 있게 한다.
+#
+# 그룹 정의:
+#   latin   — ASCII A-Z/a-z + Latin Extended (베트남어 분음 포함; 0x00C0-0x024F)
+#   zh      — CJK Unified Ideographs (0x4E00-0x9FFF) — 일본어 한자와 공유
+#   kana    — Hiragana/Katakana (0x3040-0x30FF) — 일본어 고유 신호
+#   hangul  — Hangul Syllables (0xAC00-0xD7A3) + Jamo (0x1100-0x11FF)
+#   deva    — Devanagari (0x0900-0x097F) — 네팔/힌디
+#   thai    — Thai (0x0E00-0x0E7F)
+#   khmer   — Khmer (0x1780-0x17FF)
+# 공백/구두점/숫자 같은 비-script ASCII 는 카운트 제외.
+def _script_summary(text: str) -> str:
+    counts = {
+        "latin": 0, "zh": 0, "kana": 0, "hangul": 0,
+        "deva": 0, "thai": 0, "khmer": 0,
+    }
+    if not text:
+        return " ".join(f"{k}={v}" for k, v in counts.items())
+    for ch in text:
+        c = ord(ch)
+        if c <= 0x7F:
+            if 0x41 <= c <= 0x5A or 0x61 <= c <= 0x7A:
+                counts["latin"] += 1
+        elif 0x00C0 <= c <= 0x024F:
+            counts["latin"] += 1
+        elif 0xAC00 <= c <= 0xD7A3 or 0x1100 <= c <= 0x11FF:
+            counts["hangul"] += 1
+        elif 0x3040 <= c <= 0x30FF:
+            counts["kana"] += 1
+        elif 0x4E00 <= c <= 0x9FFF:
+            counts["zh"] += 1
+        elif 0x0900 <= c <= 0x097F:
+            counts["deva"] += 1
+        elif 0x0E00 <= c <= 0x0E7F:
+            counts["thai"] += 1
+        elif 0x1780 <= c <= 0x17FF:
+            counts["khmer"] += 1
+    return " ".join(f"{k}={v}" for k, v in counts.items())
 
 
 def _diag(event: str, **fields) -> None:
@@ -2152,7 +2254,7 @@ async def process_chunk(
                     segments_count=len(segments),
                 )
                 diarize = await _process_diarization_segments(
-                    client, segments, sess, latency,
+                    client, segments, sess, latency, stt_lang=stt_lang,
                 )
                 enriched_segments = diarize["enriched_segments"]
                 top_translated = diarize["top_translated"]

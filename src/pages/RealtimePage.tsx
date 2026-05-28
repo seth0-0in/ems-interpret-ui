@@ -354,6 +354,56 @@ function computeRms(samples: Float32Array): number {
   return Math.sqrt(sum / samples.length);
 }
 
+// debug 진단용 — STT 결과 텍스트의 script 분포만 카운트해 콘솔에 남긴다.
+// 발화 원문은 절대 포함하지 않는다 — 글자 단위로 어느 유니코드 블록인지만
+// 집계해 LID 가 어디로 판정될 가능성이 큰지 한 줄로 확인할 수 있게 한다.
+//
+// 다국어 STT 진단 시나리오:
+//   "도와주세요" → "ko=5"
+//   "你好" → "zh=2"
+//   "助けて" → "ja=3" (히라가나)·"zh=1" (CJK 統합 한자 — 일본어와 공유)
+//   "សួស្តី" → "km=5"
+//   "नमस्ते" → "deva=5"
+//   "you know what" → "latin=11"
+// 카운트가 모두 0 이면 텍스트 자체가 없거나 punctuation 만 있는 케이스.
+function summarizeUnicodeScripts(text: string): string {
+  if (!text) return "(empty)";
+  const counts = {
+    ko: 0, // Hangul syllables/jamo
+    ja: 0, // Hiragana + Katakana (CJK 한자는 zh 로 셈)
+    zh: 0, // CJK Unified Ideographs (일·중 공유)
+    latin: 0,
+    cyrillic: 0,
+    arabic: 0,
+    deva: 0, // Devanagari (네팔/힌디)
+    thai: 0,
+    khmer: 0,
+    other: 0,
+  };
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c <= 0x007f) {
+      if ((c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a)) counts.latin++;
+      // ASCII 공백·구두점 등은 카운트 제외 (script 신호가 아님)
+    } else if (c >= 0xac00 && c <= 0xd7a3) counts.ko++;
+    else if (c >= 0x1100 && c <= 0x11ff) counts.ko++;
+    else if (c >= 0x3040 && c <= 0x30ff) counts.ja++;
+    else if (c >= 0x4e00 && c <= 0x9fff) counts.zh++;
+    else if (c >= 0x0400 && c <= 0x04ff) counts.cyrillic++;
+    else if (c >= 0x0600 && c <= 0x06ff) counts.arabic++;
+    else if (c >= 0x0900 && c <= 0x097f) counts.deva++;
+    else if (c >= 0x0e00 && c <= 0x0e7f) counts.thai++;
+    else if (c >= 0x1780 && c <= 0x17ff) counts.khmer++;
+    else if (c >= 0x00c0 && c <= 0x024f) counts.latin++;
+    else counts.other++;
+  }
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(counts)) {
+    if (v > 0) parts.push(`${k}=${v}`);
+  }
+  return parts.length > 0 ? parts.join(",") : "(no-script)";
+}
+
 
 // 발화 종료로 판정하기 위한 무음 임계값(ms). VAD의 redemptionMs로 전달된다.
 // 값이 크면 한 chunk가 길어져 문장이 덜 잘리지만 latency가 커진다.
@@ -832,6 +882,10 @@ function RealtimePage() {
     form.append("client_seq", String(seqId));
     form.append("mode", mode);
     // 서버 메모리가 휘발됐을 때 신고자 언어 컨텍스트를 부트스트랩할 수 있도록 hint 로 전달.
+    // ⚠ 이 hint 는 백엔드에서 SessionState 부트스트랩에만 쓰이며 (백엔드 line ~1980-1995),
+    //   STT call 의 `language` 필드로는 EMS_STT_USE_LANGUAGE_HINT=true 일 때만 전파된다
+    //   (기본 false — 게이트웨이 auto-detect 유지). 진단 패널에서 prev_caller_lang 값이
+    //   매 chunk 에 살아 있는지 / 통역 시작·대화 초기화 시 null 로 리셋되는지 확인 가능.
     const prevCallerLang = latestCallerLangRef.current;
     if (prevCallerLang) {
       form.append("previous_caller_language", prevCallerLang);
@@ -848,6 +902,20 @@ function RealtimePage() {
       mode,
       url: requestUrl,
       baseUrl: import.meta.env.BASE_URL,
+    });
+    // LID 진단 — 백엔드 STT call 자체가 auto-detect 인지 여부를 클라이언트만 보고는
+    // 알 수 없다. 클라가 영향 줄 수 있는 단 하나의 입력 = previous_caller_language 가
+    // 매 chunk 에 어떻게 들어가는지 / sessionId 가 어떻게 유지되는지를 남긴다.
+    // (백엔드의 stt_language_hint_sent / value 는 envelope 에 노출되지 않으므로 서버
+    //  로그 측에서 따로 확인해야 함 — 보고서 참고.)
+    diag("stt_request_built", {
+      seqId,
+      mode,
+      session_id_head: sessionIdRef.current.slice(0, 8),
+      previous_caller_language: prevCallerLang ?? null,
+      previous_caller_language_sent: prevCallerLang !== null,
+      blobBytes: blob.size,
+      blobType: blob.type,
     });
 
     const res = await fetch(requestUrl, {
@@ -1213,6 +1281,11 @@ function RealtimePage() {
       skipChunkAudio(seqId);
       return;
     }
+    // ⚠ 119 운영 — 발화 원문 (env.text / env.translated) 은 콘솔에 남기지 않는다.
+    //   text_len / translated_len / unicode 스크립트 분포 + 백엔드가 확정한
+    //   source_language / target_language 까지만 노출. unicode_text_scripts 는 STT 결과의
+    //   유니코드 블록 카운트 (예: "ko=5,latin=1") — 백엔드 LID (source_language) 가 글자
+    //   분포와 맞는지 한눈에 진단 가능. 글자 자체는 카운트 외에는 빠져나가지 않는다.
     diag("process_response", {
       seqId,
       status: env.status,
@@ -1221,6 +1294,11 @@ function RealtimePage() {
       translated_len: (env.translated ?? "").length,
       source_language: env.source_language,
       target_language: env.target_language,
+      // env.text 가 fragment 든 commit 이든 글자 분포는 항상 LID 진단에 유용.
+      unicode_text_scripts: summarizeUnicodeScripts(env.text ?? ""),
+      // 이 chunk 가 보낸 prev_caller_lang 이 envelope source_language 와 맞는지 비교용.
+      previous_caller_language_sent_for_this_chunk:
+        latestCallerLangRef.current ?? null,
       speaker: env.speaker,
       speaker_confidence: env.speaker_confidence,
       has_audio: !!env.audio_base64,
